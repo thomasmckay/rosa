@@ -405,6 +405,10 @@ google.golang.org/protobuf/types/descriptorpb
 google.golang.org/protobuf/types/known/anypb
 google.golang.org/protobuf/types/known/durationpb
 google.golang.org/protobuf/types/known/timestamppb
+# gopkg.in/dnaeon/go-vcr.v3 v3.1.2
+## explicit; go 1.19
+gopkg.in/dnaeon/go-vcr.v3/cassette
+gopkg.in/dnaeon/go-vcr.v3/recorder
 # gopkg.in/square/go-jose.v2 v2.6.0
 ## explicit
 gopkg.in/square/go-jose.v2
