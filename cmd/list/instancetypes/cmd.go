@@ -24,9 +24,20 @@ import (
 	cmv1 "github.com/openshift-online/ocm-sdk-go/clustersmgmt/v1"
 	"github.com/spf13/cobra"
 
+	"github.com/openshift/rosa/pkg/arguments"
+	"github.com/openshift/rosa/pkg/aws"
+	"github.com/openshift/rosa/pkg/helper"
+	"github.com/openshift/rosa/pkg/interactive"
+	"github.com/openshift/rosa/pkg/interactive/confirm"
 	"github.com/openshift/rosa/pkg/output"
 	"github.com/openshift/rosa/pkg/rosa"
 )
+
+var args struct {
+	availabilityZones []string
+	region            string
+	roleArn           string
+}
 
 var Cmd = &cobra.Command{
 	Use:     "instance-types",
@@ -39,6 +50,27 @@ var Cmd = &cobra.Command{
 }
 
 func init() {
+	flags := Cmd.Flags()
+
+	flags.StringVar(
+		&args.roleArn,
+		"role-arn",
+		"",
+		"STS Role ARN to use when listing by region and availability zone.",
+	)
+
+	flags.StringSliceVar(
+		&args.availabilityZones,
+		"availability-zones",
+		nil,
+		"Limit listing to specified availability zones. "+
+			"Format should be a comma-separated list.")
+
+	aws.AddModeFlag(Cmd)
+
+	confirm.AddFlag(flags)
+	interactive.AddFlag(flags)
+	arguments.AddRegionFlag(flags)
 	output.AddFlag(Cmd)
 }
 
@@ -46,9 +78,83 @@ func run(cmd *cobra.Command, _ []string) {
 	r := rosa.NewRuntime().WithOCM()
 	defer r.Cleanup()
 
-	r.Reporter.Debugf("Fetching instance types")
+	region, err := aws.GetRegion(arguments.GetRegion())
+	if err != nil {
+		r.Reporter.Errorf("Error getting region: %v", err)
+		os.Exit(1)
+	}
+	args.region = region
 
-	machineTypes, err := r.OCMClient.GetAvailableMachineTypes()
+	var availabilityZones []string
+	var selectAvailabilityZones bool
+	if interactive.Enabled() {
+
+		supportedRegions, err := r.OCMClient.GetDatabaseRegionList()
+		if err != nil {
+			r.Reporter.Errorf("Unable to retrieve supported regions: %v", err)
+		}
+		awsClient := aws.GetAWSClientForUserRegion(r.Reporter, r.Logger, supportedRegions, false)
+		r.AWSClient = awsClient
+
+		isAvailabilityZonesSet := cmd.Flags().Changed("availability-zones")
+		if isAvailabilityZonesSet {
+			availabilityZones = args.availabilityZones
+		} else {
+			selectAvailabilityZones, err = interactive.GetBool(interactive.Input{
+				Question: "Select availability zones",
+				Help:     cmd.Flags().Lookup("availability-zones").Usage,
+				Default:  false,
+				Required: false,
+			})
+			if err != nil {
+				r.Reporter.Errorf("Expected a valid value for select-availability-zones: %s", err)
+				os.Exit(1)
+			}
+
+			if selectAvailabilityZones {
+				optionsAvailabilityZones, err := awsClient.DescribeAvailabilityZones()
+				if err != nil {
+					r.Reporter.Errorf("Failed to get the list of the availability zone: %s", err)
+					os.Exit(1)
+				}
+
+				availabilityZones, err = interactive.GetMultipleOptions(interactive.Input{
+					Question: "Availability zones",
+					Help:     cmd.Flags().Lookup("availability-zones").Usage,
+					Required: false,
+					Options:  optionsAvailabilityZones,
+					Validators: []interactive.Validator{
+						interactive.AvailabilityZonesCountValidator(true),
+					},
+				})
+				if err != nil {
+					r.Reporter.Errorf("Expected valid availability zones: %s", err)
+					os.Exit(1)
+				}
+			}
+		}
+
+		if isAvailabilityZonesSet || selectAvailabilityZones {
+			regionAvailabilityZones, err := awsClient.DescribeAvailabilityZones()
+			if err != nil {
+				r.Reporter.Errorf("Failed to get the list of the availability zone: %s", err)
+				os.Exit(1)
+			}
+			for _, az := range availabilityZones {
+				if !helper.Contains(regionAvailabilityZones, az) {
+					r.Reporter.Errorf("Expected a valid availability zone, "+
+						"'%s' doesn't belong to region '%s' availability zones", az, awsClient.GetRegion())
+					os.Exit(1)
+				}
+			}
+		}
+	}
+
+	r.Reporter.Debugf("Fetching instance types")
+	machineTypes, err := r.OCMClient.GetAvailableMachineTypesInRegion(region, args.availabilityZones,
+		args.roleArn, awsClient)
+
+	//machineTypes, err := r.OCMClient.GetAvailableMachineTypes()
 	if err != nil {
 		r.Reporter.Errorf("Failed to fetch instance types: %v", err)
 		os.Exit(1)
