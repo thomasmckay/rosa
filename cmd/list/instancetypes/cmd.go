@@ -35,8 +35,10 @@ import (
 
 var args struct {
 	availabilityZones []string
+	hasQuota          bool
 	region            string
 	roleArn           string
+	listAll           bool
 }
 
 var Cmd = &cobra.Command{
@@ -45,26 +47,51 @@ var Cmd = &cobra.Command{
 	Short:   "List Instance types",
 	Long:    "List Instance types that are available for use with ROSA.",
 	Example: `  # List all instance types
-  rosa list instance-types`,
+  rosa list instance-types --all`,
 	Run: run,
 }
 
 func init() {
 	flags := Cmd.Flags()
 
-	flags.StringVar(
-		&args.roleArn,
-		"role-arn",
-		"",
-		"STS Role ARN to use when listing by region and availability zone.",
-	)
-
 	flags.StringSliceVar(
 		&args.availabilityZones,
 		"availability-zones",
 		nil,
 		"Limit listing to specified availability zones. "+
-			"Format should be a comma-separated list.")
+			"Format should be a comma-separated list.",
+	)
+
+	flags.BoolVar(
+		&args.hasQuota,
+		"has-quota",
+		true,
+		"Limit listing to only those with available quota for cluster creation.",
+	)
+
+	/*
+		flags.StringVar(
+			&args.region,
+			"region",
+			"",
+			"Limit listing to a region.",
+		)
+	*/
+
+	flags.StringVar(
+		&args.roleArn,
+		"role-arn",
+		"",
+		"STS Role ARN to use when listing instance types.",
+	)
+
+	flags.BoolVar(
+		&args.listAll,
+		"all",
+		false,
+		"List all directly from AWS regardless of availability for cluster creation. "+
+			"(No other arguments accepted.)",
+	)
 
 	aws.AddModeFlag(Cmd)
 
@@ -78,74 +105,97 @@ func run(cmd *cobra.Command, _ []string) {
 	r := rosa.NewRuntime().WithOCM()
 	defer r.Cleanup()
 
+	var availabilityZones []string
+	var selectAvailabilityZones bool
+
+	supportedRegions, err := r.OCMClient.GetDatabaseRegionList()
+	if err != nil {
+		r.Reporter.Errorf("Unable to retrieve supported regions: %v", err)
+	}
+	awsClient := aws.GetAWSClientForUserRegion(r.Reporter, r.Logger, supportedRegions, false)
+	r.AWSClient = awsClient
+
 	region, err := aws.GetRegion(arguments.GetRegion())
 	if err != nil {
 		r.Reporter.Errorf("Error getting region: %v", err)
 		os.Exit(1)
 	}
-	args.region = region
 
-	var availabilityZones []string
-	var selectAvailabilityZones bool
+	regionList, _, err := r.OCMClient.GetRegionList(false, args.roleArn, "", "",
+		awsClient, false, false)
+	if err != nil {
+		r.Reporter.Errorf(fmt.Sprintf("%s", err))
+		os.Exit(1)
+	}
+	if region == "" {
+		r.Reporter.Errorf("Expected a valid AWS region")
+		os.Exit(1)
+	}
+
 	if interactive.Enabled() {
-
-		supportedRegions, err := r.OCMClient.GetDatabaseRegionList()
+		region, err = interactive.GetOption(interactive.Input{
+			Question: "AWS region",
+			Help:     cmd.Flags().Lookup("region").Usage,
+			Options:  regionList,
+			Default:  region,
+			Required: true,
+		})
 		if err != nil {
-			r.Reporter.Errorf("Unable to retrieve supported regions: %v", err)
+			r.Reporter.Errorf("Expected a valid AWS region: %s", err)
+			os.Exit(1)
 		}
-		awsClient := aws.GetAWSClientForUserRegion(r.Reporter, r.Logger, supportedRegions, false)
-		r.AWSClient = awsClient
+	}
 
-		isAvailabilityZonesSet := cmd.Flags().Changed("availability-zones")
-		if isAvailabilityZonesSet {
-			availabilityZones = args.availabilityZones
-		} else {
-			selectAvailabilityZones, err = interactive.GetBool(interactive.Input{
-				Question: "Select availability zones",
-				Help:     cmd.Flags().Lookup("availability-zones").Usage,
-				Default:  false,
-				Required: false,
-			})
-			if err != nil {
-				r.Reporter.Errorf("Expected a valid value for select-availability-zones: %s", err)
-				os.Exit(1)
-			}
-
-			if selectAvailabilityZones {
-				optionsAvailabilityZones, err := awsClient.DescribeAvailabilityZones()
-				if err != nil {
-					r.Reporter.Errorf("Failed to get the list of the availability zone: %s", err)
-					os.Exit(1)
-				}
-
-				availabilityZones, err = interactive.GetMultipleOptions(interactive.Input{
-					Question: "Availability zones",
-					Help:     cmd.Flags().Lookup("availability-zones").Usage,
-					Required: false,
-					Options:  optionsAvailabilityZones,
-					Validators: []interactive.Validator{
-						interactive.AvailabilityZonesCountValidator(true),
-					},
-				})
-				if err != nil {
-					r.Reporter.Errorf("Expected valid availability zones: %s", err)
-					os.Exit(1)
-				}
-			}
+	isAvailabilityZonesSet := cmd.Flags().Changed("availability-zones")
+	if isAvailabilityZonesSet {
+		availabilityZones = args.availabilityZones
+	}
+	if interactive.Enabled() {
+		selectAvailabilityZones, err = interactive.GetBool(interactive.Input{
+			Question: "Select availability zones",
+			Help:     cmd.Flags().Lookup("availability-zones").Usage,
+			Default:  false,
+			Required: false,
+		})
+		if err != nil {
+			r.Reporter.Errorf("Expected a valid value for select-availability-zones: %s", err)
+			os.Exit(1)
 		}
 
-		if isAvailabilityZonesSet || selectAvailabilityZones {
-			regionAvailabilityZones, err := awsClient.DescribeAvailabilityZones()
+		if selectAvailabilityZones {
+			optionsAvailabilityZones, err := awsClient.DescribeAvailabilityZones()
 			if err != nil {
 				r.Reporter.Errorf("Failed to get the list of the availability zone: %s", err)
 				os.Exit(1)
 			}
-			for _, az := range availabilityZones {
-				if !helper.Contains(regionAvailabilityZones, az) {
-					r.Reporter.Errorf("Expected a valid availability zone, "+
-						"'%s' doesn't belong to region '%s' availability zones", az, awsClient.GetRegion())
-					os.Exit(1)
-				}
+
+			availabilityZones, err = interactive.GetMultipleOptions(interactive.Input{
+				Question: "Availability zones",
+				Help:     cmd.Flags().Lookup("availability-zones").Usage,
+				Required: false,
+				Options:  optionsAvailabilityZones,
+				Validators: []interactive.Validator{
+					interactive.AvailabilityZonesCountValidator(true),
+				},
+			})
+			if err != nil {
+				r.Reporter.Errorf("Expected valid availability zones: %s", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	if isAvailabilityZonesSet || selectAvailabilityZones {
+		regionAvailabilityZones, err := awsClient.DescribeAvailabilityZones()
+		if err != nil {
+			r.Reporter.Errorf("Failed to get the list of the availability zone: %s", err)
+			os.Exit(1)
+		}
+		for _, az := range availabilityZones {
+			if !helper.Contains(regionAvailabilityZones, az) {
+				r.Reporter.Errorf("Expected a valid availability zone, "+
+					"'%s' doesn't belong to region '%s' availability zones", az, awsClient.GetRegion())
+				os.Exit(1)
 			}
 		}
 	}
