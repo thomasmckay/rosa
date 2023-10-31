@@ -93,8 +93,6 @@ func init() {
 			"(No other arguments accepted.)",
 	)
 
-	aws.AddModeFlag(Cmd)
-
 	confirm.AddFlag(flags)
 	interactive.AddFlag(flags)
 	arguments.AddRegionFlag(flags)
